@@ -1,800 +1,700 @@
 'use strict';
 
+const { google } = require('googleapis');
+const { getProtoPath } = require('google-proto-files');
 
-var Alexa = require('alexa-sdk');
-var google = require('./node_modules/googleapis');
+const Alexa = require('alexa-sdk');
 const AWS = require('aws-sdk');
-var fs = require('fs');
-var every = require('every-moment');
-var wait = require('wait-one-moment');
-const Stream = require("stream");
-var lame = require('lame');
-var grpc = require('grpc')
-var resolve = require('path').resolve;
-var volume = require('pcm-volume');
+const Stream = require('stream');
+const Volume = require('pcm-volume');
 
-
-
-var OAuth2 = google.auth.OAuth2;
-
-
-var assistant;
-var audio_chunk = 0;
-var microphoneOpen = true;
-var sendingAudio = false;
-
-// create JSON string to hold config
-var config = {};
+const fs = require('fs');
+const grpc = require('@grpc/grpc-js');
+const lame = require('@suldashi/lame');
+const request = require('request');
+const xmlescape = require('xml-escape');
+const protoLoader = require('@grpc/proto-loader');
 
 // Load AWS credentials
-const Polly = new AWS.Polly();
-var s3 = new AWS.S3();
+const s3 = new AWS.S3();
 
-                
-const blank_audio_long = Buffer.alloc(80000,0); 
+// Get Google Credentials from Environment Variables - these are set in the Lambda function configuration
 
+const S3_BUCKET = process.env.S3_BUCKET;
+const API_ENDPOINT = process.env.API_ENDPOINT;
 
-// Get Google Credentials from Evironment Variables - these are set in the Lambda function configuration
-
-const VERSION_NUMBER = '1.0';
-var CLIENT_ID = process.env.CLIENT_ID;
-var CLIENT_SECRET = process.env.CLIENT_SECRET;
-var REDIRECT_URL = process.env.REDIRECT_URL;
-var API_ENDPOINT = process.env.API_ENDPOINT;
-var S3_BUCKET = process.env.S3_BUCKET;
-
-
-
-
-var oauth2Client = new OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URL);
-
-// load assistant API proto and bind using grpc
-
-const protoDescriptor = grpc.load({
-  file: 'assistant/embedded/v1alpha1/embedded_assistant.proto',
-  root: resolve(__dirname, 'proto')
+const protoDefinition = protoLoader.loadSync('google/assistant/embedded/v1alpha2/embedded_assistant.proto', {
+    includeDirs: [getProtoPath('..')],
+    enums: String,
+    longs: String,
+    defaults: true,
+    keepCase: true,
+    oneofs: true,
 });
+const protoDescriptor = grpc.loadPackageDefinition(protoDefinition);
+const assistantClient = protoDescriptor.google.assistant.embedded.v1alpha2.EmbeddedAssistant;
 
-const EmbeddedAssistantClient = protoDescriptor.google.assistant.embedded.v1alpha1.EmbeddedAssistant;
+const clientState = {
+    locale: undefined,
+    s3Config: undefined,
+    projectId: undefined,
+    registered: false,
+    initialized: false,
+    oauth2Client: undefined,
+    deviceLocation: undefined,
+};
 
-const embedded_assistant = protoDescriptor.google.assistant.embedded.v1alpha1;
-const callCreds = new grpc.Metadata();
+const SUPPORTED_LOCALES = ['en-GB', 'de-DE', 'en-AU', 'en-CA', 'en-IN', 'ja-JP'];
 
+function getSecretParams() {
+    const s3Params = {
+        Bucket: S3_BUCKET,
+        Key: 'client_secret.json',
+    };
 
-const END_OF_UTTERANCE = 'END_OF_UTTERANCE';
-const EVENT_TYPE = 'event_type';
-const RESULT = 'result';
-const AUDIO_OUT = 'audio_out';
+    console.log('Getting JSON');
 
-var conversation_State = Buffer.alloc(0);
-var error_text;
+    return new Promise((resolve, reject) => {
+        s3.getObject(s3Params, function (err, data) {
+            if (err) {
+                return reject(new Error('I could not load the client secret file from S3.'));
+            }
 
+            console.log('Current ConfigJSON: ' + JSON.stringify(clientState.s3Config));
+            const s3Config = JSON.parse(Buffer.from(data.Body).toString('utf8'));
 
-var APP_ID = undefined; //replace with 'amzn1.echo-sdk-ams.app.[your-unique-value-here]'; NOTE THIS IS A COMPLETELY OPTIONAL STEP WHICH MAY CAUSE MORE ISSUES THAN IT SOLVES IF YOU DON'T KNOW WHAT YOU ARE DOING
+            if (!s3Config.hasOwnProperty('web')) {
+                return reject(new Error('The client secret file was not configured for a web based client.'));
+            }
 
+            console.log('S3 Config is loaded: ' + JSON.stringify(s3Config));
 
-// check whether the S3 bucket exisits
+            const clientId = s3Config.web.client_id;
+            const redirectUri = s3Config.web.redirect_uris[0];
+            const clientSecret = s3Config.web.client_secret;
 
-if (S3_BUCKET){
-    
-    var bucket_params = {
-      Bucket: S3_BUCKET
-     };
-     s3.headBucket(bucket_params, function(err, data) {
-       if (err) {
-           console.log ('S3 Bucket does not exist - lets try and create it')
-           s3.createBucket(bucket_params, function(err, data) {
-               if (err) {
-                   console.log('Could not create bucket', err.stack);
-                   error_text = 'The S3 Bucket could not be created - make sure you have set up the IAM role properly or alternatively try a different random bucket name'
-               }
-               
-               else     {
-                   console.log('Bucket Created');
-               }
-               
-         });
-           
-       }
-       else {
-           console.log('Bucket already exists');
+            clientState.s3Config = s3Config;
+            clientState.projectId = s3Config.web.project_id;
+            clientState.registered = !!s3Config.registered;
+            clientState.initialized = true;
+            clientState.oauth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+            clientState.deviceLocation = s3Config.device_location;
 
-       }
-     });
-  
+            return resolve();
+        });
+    });
 }
 
+async function registerProject(scope$) {
+    console.log('Project registration started.');
 
-var handlers = {
-    
-    'LaunchRequest': function () {
+    if (clientState.registered) {
+        console.warn('Project is already registered.');
+        return;
+    }
 
-        // Check for required environment variables and throw spoken error if not present
-        
-        if (error_text){
-            this.emit(':tell', error_text);   
+    if (!clientState.initialized) {
+        try {
+            await getSecretParams();
+        } catch (err) {
+            console.error('Loading of SecretParams failed: ' + err);
+            throw err;
         }
-        if (!CLIENT_ID){
-            this.emit(':tell','ERROR! Client ID is not set in Lambda Environment Variables','ERROR! Client ID is not set in Lambda Environment Variables')
-        }
-        if (!CLIENT_SECRET){
-            this.emit(':tell','ERROR! Client Secret is not set in Lambda Environment Variables','ERROR! Client Secret is not set in Lambda Environment Variables')
-        }
-        if (!REDIRECT_URL){
-            this.emit(':tell','ERROR! Redirect URL is not set in Lambda Environment Variables','ERROR! Redirect URL is not set in Lambda Environment Variables')
-        }
-        if (!API_ENDPOINT){
-            this.emit(':tell','ERROR! API endpoint is not set in Lambda Environment Variables','ERROR! API Endpoint is not set in Lambda Environment Variables')
-        }
-        if (!S3_BUCKET){
-            this.emit(':tell','ERROR! S3 Bucket is not set in Lambda Environment Variables','ERROR! S3 Bucket is not set in Lambda Environment Variables')
-        }
-        
-        if (!this.event.session.user.accessToken) {
-            
-                      
-            this.emit(':tellWithLinkAccountCard', "You must link your Google account to use this skill. Please use the link in the Alexa app to authorise your Google Account.");
-        
-        } else {
-       
-       //authenticate(session.user.accessToken);
-        this.emit(':ask', "How may I help?");      
+    }
+
+    // This isn't massively efficient code but it only needs to run once!
+    const ACCESS_TOKEN = scope$.event.context.System.user.accessToken;
+
+    console.log('Access Token: ' + ACCESS_TOKEN);
+
+    // Authenticate against Google OAUTH2
+    clientState.oauth2Client.setCredentials({ access_token: ACCESS_TOKEN });
+
+    const registrationModelURL = 'https://embeddedassistant.googleapis.com/v1alpha2/projects/' + clientState.projectId + '/deviceModels/';
+    const registrationInstanceURL = 'https://embeddedassistant.googleapis.com/v1alpha2/projects/' + clientState.projectId + '/devices/';
+
+    // Create Stub
+    const bearer = 'Bearer ' + ACCESS_TOKEN;
+
+    // Registering Model
+    const registerModel = function (callback) {
+        const deviceModel = {
+            project_id: clientState.projectId,
+            device_model_id: clientState.projectId,
+            manifest: {
+                manufacturer: 'Assistant SDK developer',
+                product_name: 'Alexa Assistant v1',
+                device_description: 'Alexa Assistant Skill v1',
+            },
+            device_type: 'action.devices.types.LIGHT',
+            traits: ['action.devices.traits.OnOff'],
         };
-        
-    },
+        const postOptions = {
+            url: registrationModelURL,
+            method: 'POST',
+            headers: {
+                Authorization: bearer,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(deviceModel),
+        };
+        request(postOptions, function (error, response, body) {
+            if (error) {
+                callback(error, null);
+            } else if (response) {
+                const bodyJSON = JSON.parse(body);
 
-    'SearchIntent': function (overrideText) {
-        
-        console.log('Starting Search Intent')
-        
-        
-        // Function variables
-        var setupStart = new Date().getTime();
-        var encodeStart;
-        var encodeTotal;
-        var pollyStart
-        var pollyTotal;
-        var audioSendStart;
-        var audioSendTotal;
-        var responseWaitStart;
-        var responseWaitTotal;
-        var uploadStart;
-        var uploadTotal;
-        var setupTotal;
-        var audioLength = 0;
-        var searchFunction = this;
-        var googleUtternaceText;
-        var audioPresent = false;
-        
+                if (bodyJSON.error) {
+                    console.log('error code received');
 
-            
-        // Check for required environment variables and throw spoken error if not present
-        
-        if (!CLIENT_ID){
-            this.emit(':tell','ERROR! Client ID is not set in Lambda Environment Variables','ERROR! Client ID is not set in Lambda Environment Variables')
-        }
-        if (!CLIENT_SECRET){
-            this.emit(':tell','ERROR! Client Secret is not set in Lambda Environment Variables','ERROR! Client Secret is not set in Lambda Environment Variables')
-        }
-        if (!REDIRECT_URL){
-            this.emit(':tell','ERROR! Redirect URL is not set in Lambda Environment Variables','ERROR! Redirect URL is not set in Lambda Environment Variables')
-        }
-        if (!API_ENDPOINT){
-            this.emit(':tell','ERROR! API endpoint is not set in Lambda Environment Variables','ERROR! API Endpoint is not set in Lambda Environment Variables')
-        }
-        if (!S3_BUCKET){
-            this.emit(':tell','ERROR! S3 Bucket Name is not set in Lambda Environment Variables','ERROR! S3 Bucket Name is not set in Lambda Environment Variables')
-        }
-
-        
-        // Check for optional environment variables otherwise set to defaults
-        
-        
-        var DEBUG_MODE = process.env.DEBUG_MODE;
-        
-    
-        var POLLY_VOICE = process.env.POLLY_VOICE;
-        
-        // Whilst the Assistant API is US only 'Joey' seems to to be the best option for recognition
-        if (!POLLY_VOICE){
-            POLLY_VOICE = 'Joey';
-        }
-        
-        
-        var CHUNK_SIZE = process.env.CHUNK_SIZE;
-        if (!CHUNK_SIZE){
-            CHUNK_SIZE = 32000;
-        }
-        
-        console.log('CHUNK_SIZE: ' + CHUNK_SIZE);
-        
-        var SEND_SPEED = process.env.SEND_SPEED;
-        if (!SEND_SPEED){
-            SEND_SPEED = 0.1;
-        }
-        
-        console.log('SEND_SPEED: ' + SEND_SPEED);
-        
-        
-        // See if text value recieved from Alexa is being over-ridden with value in environment variable
-        var UTTERANCE_TEXT =  process.env.UTTERANCE_TEXT;
-        var alexaUtteranceText;
-        
-        // No environent variable set
-        if (!UTTERANCE_TEXT){
-            // Have we recieved an direct utterance from another intent?
-            if (overrideText){
-                alexaUtteranceText = overrideText;
-                console.log("Utterance recieved from another intent: " + overrideText);
-                
-            } else {
-            // use detected utterance  
-            alexaUtteranceText = this.event.request.intent.slots.search.value;
-            var alexaUtteranceText_original = this.event.request.intent.slots.search.value;
-            }
-        } else {
-            // otherwise use value in environment variable
-            alexaUtteranceText = UTTERANCE_TEXT;
-            console.log('Utternace text overidden in environment variables: ' + UTTERANCE_TEXT);
-        }
-
-        
-        console.log('Input text to be processed is "' + alexaUtteranceText +'"');
-        var ACCESS_TOKEN = this.event.session.user.accessToken;
-
-        
-        // Check whether we have a valid authentication token
-        if (!ACCESS_TOKEN) { 
-            // We haven't so cretae an account link card
-            this.emit(':tellWithLinkAccountCard', "You must link your Google account to use this skill. Please use the link in the Alexa app to authorise your Google Account.");
-        
-        } else {
-                 
-            console.log('Starting Google Assistant')
-            // console.log(ACCESS_TOKEN);
-
-            // authenticate against OAuth using session accessToken
-            
-            oauth2Client.setCredentials({access_token: ACCESS_TOKEN });
-            const call_creds = grpc.credentials.createFromGoogleCredential(oauth2Client);
-            var channelCreds = grpc.credentials.createSsl(null);
-            var combinedCreds = grpc.credentials.combineChannelCredentials(channelCreds, call_creds);
-            assistant = new EmbeddedAssistantClient(API_ENDPOINT, combinedCreds);  
-
-            const options = {};
-            // create a timed event incase something causes the skill to stall
-            // This will stop the skill from timing out
-            wait(8, 'seconds', function() { 
-                if (audioPresent == false){
-                  searchFunction.emit(':tell',"I wasn't able to talk to Google - please try again") 
-                }
-                            
-                        
-            })
-            
-            // Create new GRPC stub to communicate with Assistant API
-            const conversation = assistant.converse(callCreds, options);
-            
-            //Deal with errors from Google API
-            // These aren't necessarily all bad unless they are fatal
-            conversation.on('error', err => {
-              console.log('***There was a Google error**' + err);
-
-            });
-            
-            conversation.on('end', () => {
-                console.log('End of response from GRPC stub');
-                responseWaitTotal = new Date().getTime() - responseWaitStart;
-                // close resonse file which will then trigger encode
-                responseFile.end();
-
-            });
-            
-            // create file into which we will stream pcm response from Google
-            // Closing the stream into this file will trigger encoding into MP3
-            console.log ('Creating temp response file') 
-            var responseFile = fs.createWriteStream("/tmp/response.pcm",{flags: 'w'},{encoding: 'buffer'});
-            
-            responseFile.on('finish', function () {
-              console.log('temp response file has been written');
-                
-                const stats = fs.statSync("/tmp/response.pcm")
-                const fileSizeInBytes = stats.size
-                console.log('files size is '+ fileSizeInBytes)
-                
-                // Check whether response file has any content. If it doesn't then we have a response
-                // with no audio
-                if (fileSizeInBytes > 0 ){
-                    // encode MP3
-                    encode();
-                } else {
-                    // Save setting and exit
-
-                    // have a short pause until exiting
-                    wait(0.1, 'seconds', function() {
-                        console.log('Emiting blank sound')
-                        searchFunction.emit(':tell'," ")
-                    });
-                }
-                
-            });
-            
-            
-            // Create Audio Configuration before we send any commands
-            // We are using linear PCM as the input and output type so encoding value is 1
- 
-            console.log("Creating Audio config");
-            console.log('Current ConversationState is');
-            console.log(conversation_State);
-            
-
-            var audioSetupConfig;
-
-            
-            if (conversation_State.length < 1){
-                console.log('No prior ConverseResponse')
-                audioSetupConfig = {config: 
-                        { 
-                            audio_in_config: { encoding: 1, sample_rate_hertz: 16000 },
-                            audio_out_config: { encoding: 1, sample_rate_hertz: 16000, volume_percentage: 100 } 
-                        }
-                       }
-            } else {
-                console.log('Prior ConverseResponse detected')
-                audioSetupConfig = {config: 
-                    { 
-                        audio_in_config: { encoding: 1, sample_rate_hertz: 16000 },
-                        audio_out_config: { encoding: 1, sample_rate_hertz: 16000, volume_percentage: 100 }, 
-                        converse_state: {conversation_state: conversation_State}
+                    if (bodyJSON.error.code === 409) {
+                        console.log('Model already exists');
+                        callback(null, bodyJSON);
+                    } else {
+                        callback(bodyJSON, null);
                     }
-                   }
+                } else {
+                    callback(null, bodyJSON);
+                }
             }
-            
-            // Send audio config to API
-            conversation.write(audioSetupConfig);
-            
-            
-            
-            // Function to Split up audio part into chunks for sending to Google API in real time to simulate spoken request
-            // This function is courtesy of Richard vowles https://github.com/rvowles/node-assistant
-            
-            
-            var setupConversationAudioRequestStream = function (converseStream) {
-                const audioPipe = new Stream.Writable();
-                console.log('created audioPipe');
+        });
+    };
+    // Registering instance
+    const registerInstance = function (callback) {
+        const instanceModel = {
+            id: clientState.projectId,
+            model_id: clientState.projectId,
+            nickname: 'Alexa Assistant v1',
+            clientType: 'SDK_SERVICE',
+        };
+        const postOptions = {
+            url: registrationInstanceURL,
+            method: 'POST',
+            headers: {
+                Authorization: bearer,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(instanceModel),
+        };
+        request(postOptions, function (error, response, body) {
+            if (error) {
+                callback(error, null);
+            } else if (response) {
+                const bodyJSON = JSON.parse(body);
 
-                    audioPipe._write = (chunk, enc, next) => {
+                if (bodyJSON.error) {
+                    console.log('error code received');
 
-                        console.log('Polly audio data recieved');
-
-                        // Save total Polly respponse time
-                        pollyTotal = new Date().getTime() - pollyStart;
-                        
-                        audioSendStart = new Date().getTime();
-
-                        if (!chunk.length) {
-                            console.log('ignoring');
-                            return;
-                        }
-                        
-                        
-                        const parts = Math.ceil(chunk.length / CHUNK_SIZE);
-                        console.log('chunk length is ' + chunk.length)
-                        console.log("Parts = " + parts);
-                        const partLength = CHUNK_SIZE/32000;    
-
-                        audio_chunk++;
-                        // Delay sending of all chunk data for this part until all previous chuncks have been sent
-                        
-                        
-                        wait(partLength*parts*audio_chunk*SEND_SPEED, 'seconds', function() {    
-                            for (let count = 0; count < parts; count++) {
-                                //console.log('part: ' + count)
-                                wait(partLength*count*SEND_SPEED, 'seconds', function() {
-                                    //console.log('Sending Part: ' + count );
-                                    sendTimedData (chunk, CHUNK_SIZE, count, converseStream);
-                                });
-                            }
-                        })
-                        next();
-                };
-                audioPipe.on('end', () => {
-                    console.log('end of audio');
-                    converseStream.end();
-                });
-                return audioPipe;
+                    if (bodyJSON.error.code === 409) {
+                        console.log('Instance already exists');
+                        callback(null, bodyJSON);
+                    } else {
+                        callback(bodyJSON, null);
+                    }
+                } else {
+                    callback(null, bodyJSON);
+                }
             }
-            
-            // Save total setup time in milliseconds
-            setupTotal = new Date().getTime() - setupStart;
-            
-
-            // Google Assistant API does not accept text input        
-            // So we convert Alexa result text to audio stream using AWS Polly
-            
-            pollyStart = new Date().getTime();
-            const audioRequestStream = setupConversationAudioRequestStream(conversation);
-            audio_chunk = -1;
-            
-            // sendingAudio variable is used to track as to whether we should keep sending utterance audio to API
-            // This will be set to FALSE once "END_OF_UTTERANCE" message is recieved from Google API
-            sendingAudio = true;
-            
-            const params = {
-                                'Text': alexaUtteranceText,
-                                'OutputFormat': 'pcm',
-                                'VoiceId': POLLY_VOICE,
-                                'SampleRate': '16000',
-                                'TextType': 'text',
-                            }
-            
-            // If utterance is 'stop' then we will send pre-recorded polly audio to reduce AWS charges
-            if (alexaUtteranceText == "STOP"){
-                console.log('Send stop command pcm');
-                var readStop = fs.createReadStream('./stop.pcm');
-                readStop.pipe(audioRequestStream);
- 
-            // 'cancel' command
-            } else if (alexaUtteranceText == "CANCEL"){
-                console.log('Send cancel command pcm');
-                var readCancel = fs.createReadStream('./cancel.pcm');
-                readCancel.pipe(audioRequestStream);
-                
-            // 'exit' command
-            } else if (alexaUtteranceText == "exit"){
-                console.log('Send exit command pcm');
-                var readExit = fs.createReadStream('./exit.pcm');
-                readExit.pipe(audioRequestStream);
- 
-            // Otherwise we send utterance text to Polly
-            } else {
-            
-                var pollyAudio = Polly.synthesizeSpeech(params, (err, data) => {
+        });
+    };
+    return new Promise((resolve, reject) => {
+        // lets register the model and instance - we only need to do this once
+        registerModel(function (err, result) {
+            if (err) {
+                console.log('Got Model register error', err);
+                return reject(new Error('There was an error registering the Model with the Google API.'));
+            } else if (result) {
+                console.log('Got positive model response' + JSON.stringify(result));
+                registerInstance(function (err, result) {
                     if (err) {
-                        console.log('There was a polly error' + err.code)
-                    } else if (data) {
-                        if (data.AudioStream instanceof Buffer) {
-                            // Initiate the source
-                            console.log('Recieved polly audio');
-
-                            // Add 5 seconds of silence to stream - this is needed so that Assistant API can detect end of utterance event
-                            var totalLength = blank_audio_long.length + data.AudioStream.length;
-                            var combinedAudio = Buffer.concat([data.AudioStream, blank_audio_long] , totalLength);    
-                            // convert AudioStream into a readable stream
-                            var bufferStream = new Stream.PassThrough();
-                            bufferStream.end(combinedAudio);
-                            // Pipe into chunker for sending to Google API
-                            bufferStream.pipe(audioRequestStream);
-                        }
-                    } 
-                })
-            }
-            
-            // Deal with responses from API
-            conversation.on('data', function(ConverseResponse) {
-                //console.log(ConverseResponse);
-                if (ConverseResponse.converse_response == EVENT_TYPE){
-
-                  if (ConverseResponse.event_type ){
-                      // Look for "END_OF_UTTERANCE" event
-                      if (ConverseResponse.event_type == END_OF_UTTERANCE){
-                          console.log('End of Utterance received')
-                          // Set sendingAudio to false so that we will stop streaming audio to API
-                          sendingAudio = false;
-                          conversation.end();
-                          audioSendTotal = new Date().getTime() - audioSendStart;
-                          console.log('Audio Send Total time is ' + audioSendTotal + 'ms');
-                          responseWaitStart = new Date().getTime();
-                      }
-                  }
-
-                }
-
-                // Deal with RESULTS TYPE
-                else if (ConverseResponse.converse_response == RESULT){
-                    console.log('Result received');
-                    // check there is actually a value in result
-                    if (ConverseResponse.result ){
-
-                        if (ConverseResponse.result.spoken_request_text){
-                          console.log('Request text is: '+ JSON.stringify(ConverseResponse.result.spoken_request_text));
-                            googleUtternaceText = JSON.stringify(ConverseResponse.result.spoken_request_text);
-                           
-                        }
-                        if (ConverseResponse.result.microphone_mode){
-                            if (ConverseResponse.result.microphone_mode == 'CLOSE_MICROPHONE'){
-                                microphoneOpen = false;
-                                console.log('closing microphone');
-                            } else if (ConverseResponse.result.microphone_mode == 'DIALOG_FOLLOW_ON'){
-                                microphoneOpen = true;
-                                console.log('keeping microphone open');
-                            } 
-                        }
-                        if (ConverseResponse.result.conversation_state){
-                            if (ConverseResponse.result.conversation_state.length > 0 ){
-                                conversation_State = ConverseResponse.result.conversation_state;
-                                
-                                console.log('Conversation state changed');
-                                console.log('Conversation state var is:')
-                                
-                            }
-                        }
+                        console.log('Error:', err);
+                        return reject(new Error('There was an error registering the Instance with the Google API.'));
                     }
 
-                }
-                
-                // Deal with audio data from API
- 
-                else if (ConverseResponse.converse_response == AUDIO_OUT){
- 
-                    var audio_chunk = ConverseResponse.audio_out.audio_data;
-                    if (audio_chunk instanceof Buffer) {
-                        audioLength = audioLength + audio_chunk.length;
-                      
-                        if (audioPresent == false){
-                            audioPresent = true;
-                            
-                        }
-                        
-                        // Total length of MP3's in alexa skills must be less than 90 seconds.
-                        
-                        if ( audioLength <= (90*16*16000/8)){  // Seconds x Bits per sample x samples per second / 8 to give bytes per second
-                            responseFile.write(audio_chunk);
+                    console.log('Got positive Instance response');
 
-                        } else {
-                            // we won't write any more timestamps
-                            console.log ('Ignoring audio data as it is longer than 90 seconds')
-                                                        
-                        }
-                       
+                    const s3Body = {
+                        ...clientState.s3Config,
+                        registered: true,
                     };
- 
-                }
- 
-            })
-            
+                    const s3Params = {
+                        Bucket: S3_BUCKET,
+                        Key: 'client_secret.json',
+                        Body: JSON.stringify(s3Body),
+                        ContentType: 'application/json',
+                    };
 
- 
-             ///////////////////////////////////////////////
-            
-            //               START OF FUNCTIONS           //
-            
-            ////////////////////////////////////////////////
-            
-            
- 
- 
-            // This function sends a chunk of audio data to the Assistant API via grpc
-            var sendTimedData = function (chunk, size, count, converseStream){
+                    s3.upload(s3Params, function (err) {
+                        if (err) {
+                            return reject(new Error('There was an error uploading to S3.'));
+                        }
 
-                // Only send the chunk if the END_of_UTTERANCE command hasn't been received
-                if (sendingAudio == true){
-                    //console.log('sending to API');
-                    const converseRequest = new embedded_assistant.ConverseRequest();
-                    const end = ((count + 1) * size) > chunk.length ? chunk.length : ((count + 1) * size);
-                    const bit = new Uint8Array(chunk.slice(count * size, end));
-                    converseRequest.setAudioIn(bit);
-                    try {
-                         converseStream.write(converseRequest);
-                    }
-                    catch (err) {
-                        console.error(err);
-                    }
-                } else {
-                    console.log('End of utterance recieved - not sending data');
-                }
+                        clientState.s3Config = s3Body;
+                        scope$.attributes['microphone_open'] = false;
 
-            }
-
-            // This function take the response fromt the API and re-encodes using LAME
-            // There is lots of reading and writing from temp files which isn't ideal
-            // but I couldn't get piping to/from LAME work reliably in Lambda
-
-            var encode = function () {
-
-                console.log('Starting Transcode');
-                
-                encodeStart = new Date().getTime();
-
-                // Read the linear PCM response from file and create stream
-                var readpcm = fs.createReadStream('/tmp/response.pcm');
-                readpcm.on('end', function () {  
-                    console.log('pcm stream read complete')
-                });
-                // Create file to which MP3 will be written
-                var writemp3 = fs.createWriteStream('/tmp/response.mp3');
-
-                // Log when MP3 file is written
-                writemp3.on('finish', function () {
-                  console.log('mp3 has been written');
-                })
-
-                // Create LAME encoder instance
-                
-                var encoder = new lame.Encoder({
-                      // input
-                      channels: 1,        // 1 channels (MONO)
-                      bitDepth: 16,       // 16-bit samples
-                      sampleRate: 16000,  // 16,000 Hz sample rate
-
-                      // output
-                      bitRate: 48,
-                      outSampleRate: 16000,
-                      mode: lame.JOINTSTEREO // STEREO (default), JOINTSTEREO, DUALCHANNEL or MONO
-                    }); 
-                
-                // The output from the google assistant is much lower than Alexa so we need to apply a gain
-                var vol = new volume();
-                
-                // Set volume gain on google output to be +75%
-                // Any more than this then we risk major clipping
-                vol.setVolume(1.75);
-                
-                // Create function to upload MP3 file to S3 
-                function uploadFromStream(s3) {
-                    var pass = new Stream.PassThrough();
-                    var params = {Bucket: S3_BUCKET, Key: S3_BUCKET, Body: pass};
-                    s3.upload(params, function(err, data) {
-                        if (err){
-                        console.log('S3 upload error: ' + err) 
-                            searchFunction.emit(':tell', 'There was an error uploading to S3. Please ensure that the S3 Bucket name is correct in the environment variables and IAM permissions are set correctly');
-                            
-                        } else{
-                            // Upload has been sucessfull - we can know issue an alexa response based upon microphone state
-                            uploadTotal = new Date().getTime() - uploadStart;
-                            
-                            var signedURL;
-                            // create a signed URL to the MP3 that expires after 5 seconds - this should be plenty of time to allow alexa to load and cache mp3
-                            var signedParams = {Bucket: S3_BUCKET, Key: S3_BUCKET, Expires: 5, ResponseContentType: 'audio/mpeg'};
-                            s3.getSignedUrl('getObject', signedParams, function (err, url) {
-                                
-                                if (url){
-                                    // ampersands are not valid in SSML so we need to escape these out with &amp;
-                                    url = url.replace(/&/g, '&amp;'); // replace ampersands    
-                                    signedURL = url;
-
-                                    var cardContent = 
-                                    '*********************************************************************************\n' +
-                                    'DEBUG INFORMATION - Delete "DEBUG_MODE" environment variable to disable this card\n' +
-                                    '*********************************************************************************\n' +
-                                    'Skill Version:               ' + VERSION_NUMBER + '\n\n' +
-                                    'Alexa heard:                 ' + alexaUtteranceText_original + '\n' +
-                                    'Google assistant heard:       ' + googleUtternaceText + '\n' +
-                                    'Polly voice was:             ' + POLLY_VOICE + '\n' +
-                                    'Audio chunk size was:        ' + CHUNK_SIZE + '\n' +
-                                    'Audio send speed multiplyer: ' + SEND_SPEED + '\n' +
-                                    '*******************************PROCESSING TIMES**********************************\n' +
-                                    'Setup Total time was:           ' + setupTotal + 'ms\n' + 
-                                    'Polly Total time was:           ' + pollyTotal + 'ms\n' +
-                                    'Audio Total Send Time was:      ' + audioSendTotal + 'ms\n' +
-                                    'Response Wait time was:         ' + responseWaitTotal + 'ms\n' +
-                                    'Encode Total time was:          ' + encodeTotal + 'ms\n' +
-                                    'Total Upload time was:          ' + uploadTotal + 'ms\n\n\n' 
-
-                                    console.log(cardContent);
-                                    var cardTitle = 'Google Assistant Debug'
-
-                                    var speechOutput = '<audio src="' + signedURL + '"/>'; 
-                                    // If API has requested Microphone to stay open then will create an Alexa 'Ask' response
-                                    if (microphoneOpen == true){
-                                        console.log('Microphone is open so keeping session open')                        
-                                        console.log('Total runtime: ' + (new Date().getTime() - setupStart) );
-                                        cardContent = cardContent + ('Total runtime: ' + (new Date().getTime() - setupStart) + 
-                                        '\nMore detailed debug information can be found in the Cloud Watch logs' );
-                                        //
-                                        if (DEBUG_MODE){
-                                            console.log
-                                            searchFunction.emit(':askWithCard', speechOutput, null, cardTitle, cardContent);
-                                        } 
-                                        else {
-                                            searchFunction.emit(':ask', speechOutput);    
-                                        }
-                                    // Otherwise we create an Alexa 'Tell' command which will close the session
-                                    } else{
-                                        console.log('Microphone is closed so closing session')
-                                        console.log('Total runtime: ' + (new Date().getTime() - setupStart) );
-                                        cardContent = cardContent + ('Total runtime: ' + (new Date().getTime() - setupStart) +
-                                        '\nMore detailed debug information can be found in the Cloud Watch logs' );
-                                        if (DEBUG_MODE){
-                                            searchFunction.emit(':tellWithCard', speechOutput, cardTitle, cardContent);
-                                        } 
-                                        else {
-                                        searchFunction.emit(':tell', speechOutput);
-                                        }
-                                    }
-                                } else {
-                                    searchFunction.emit(':tell', 'There was an error creating the signed URL. Please ensure that the S3 Bucket name is correct in the environment variables and IAM permissions are set correctly');
-                                } 
-                        });
-                            
-                            
-
-                      }
+                        return resolve();
                     });
-                    return pass;
-                }
+                });
+            }
+        });
+    });
+}
 
-                // When encoding of MP3 has finished we upload the result to S3
-                encoder.on('finish', function () {
-                    encodeTotal = new Date().getTime() - encodeStart;
-                    console.log('Encode Total time is ' + encodeTotal + 'ms');
-                    uploadStart = new Date().getTime();
-                    // Close the MP3 file
-                    writemp3.end();
-                    console.error('Encoding done!');
-                    console.error('Streaming mp3 file to s3');
-                    // Create read stream from MP3 file
-                    var readmp3 = fs.createReadStream('/tmp/response.mp3');
-                    // Pipe to S3 upload function
-                    readmp3.pipe(uploadFromStream(s3));
-                });        
+function createGrpcGoogleCreds() {
+    return grpc.credentials.combineChannelCredentials(grpc.credentials.createSsl(null), grpc.credentials.createFromGoogleCredential(clientState.oauth2Client));
+}
 
+function executeAssist(token, audioState, scope$) {
+    let audioLength = 0;
+    let audioPresent = false;
+    let overrideLocale = 'en-US';
+    let conversationState = Buffer.alloc(0);
 
-                // Pipe output of PCM file reader to the gain process
-                readpcm.pipe(vol);
-                // pipe the pcm output of the gain process to the LAME encoder
-                vol.pipe(encoder);
-                // Pipe output of LAME encoder into MP3 file writer
-                encoder.pipe(writemp3);
+    console.log('Locale is: ' + clientState.locale);
 
+    if (SUPPORTED_LOCALES.includes(clientState.locale)) {
+        overrideLocale = clientState.locale;
+    }
+
+    // Update access token
+    clientState.oauth2Client.setCredentials({ access_token: token });
+
+    const grpcCreds = createGrpcGoogleCreds();
+    const assistant = new assistantClient(API_ENDPOINT, grpcCreds);
+
+    // create a timed event in case something causes the skill to stall
+    // This will stop the skill from timing out
+    setTimeout(function () {
+        if (!audioPresent) {
+            scope$.emit(':tell', "I wasn't able to talk to Google - please try again");
+        }
+    }, 9000);
+
+    // create file into which we will stream pcm response from Google
+    // Closing the stream into this file will trigger encoding into MP3
+    console.log('Creating temp response file');
+
+    let responseFile = fs.createWriteStream('/tmp/response.pcm', { flags: 'w' });
+
+    responseFile.on('finish', function () {
+        console.log('temp response file has been written');
+
+        const stats = fs.statSync('/tmp/response.pcm');
+        const fileSizeInBytes = stats.size;
+
+        console.log('files size is ' + fileSizeInBytes);
+
+        // Check whether response file has any content. If it doesn't then we have a response with no audio
+        if (fileSizeInBytes > 0) {
+            // encode MP3
+            executeEncode(audioState, scope$);
+        } else {
+            // Save setting and exit
+            console.log('Emitting blank sound');
+            scope$.emit(':tell', "I didn't get an audio response from the Google Assistant");
+        }
+    });
+
+    // Create Audio Configuration before we send any commands
+    // We are using linear PCM as the input and output type so encoding value is 1
+    console.log('Creating Audio config');
+
+    const assistRequest = {
+        config: {
+            text_query: audioState.alexaUtteranceText,
+            audio_out_config: {
+                encoding: 1,
+                volume_percentage: 100,
+                sample_rate_hertz: 16000,
+            },
+            dialog_state_in: {
+                language_code: overrideLocale,
+                device_location: clientState.deviceLocation,
+                is_new_conversation: true,
+            },
+            device_config: {
+                device_id: clientState.projectId,
+                device_model_id: clientState.projectId,
+            },
+        },
+    };
+
+    if (scope$.attributes['CONVERSATION_STATE']) {
+        console.log('Prior ConverseResponse detected');
+        conversationState = Buffer.from(scope$.attributes['CONVERSATION_STATE']);
+        assistRequest.config.dialog_state_in.conversation_state = conversationState;
+        assistRequest.config.dialog_state_in.is_new_conversation = false;
+    } else {
+        console.log('No prior ConverseResponse');
+    }
+
+    console.log('Current ConversationState is ', conversationState);
+    console.log('AssistRequest is ', assistRequest);
+
+    const conversation = assistant.Assist();
+
+    conversation.on('error', function (err) {
+        console.log('***There was a Google error***' + err);
+        scope$.emit(':tell', 'The Google API returned an error.');
+        // Clear conversation state
+        scope$.attributes['CONVERSATION_STATE'] = undefined;
+    });
+
+    conversation.on('end', function () {
+        console.log('End of response from GRPC stub');
+        // Close response file which will then trigger encode
+        responseFile.end();
+        // Clear conversation state
+        scope$.attributes['CONVERSATION_STATE'] = undefined;
+    });
+
+    conversation.on('data', function (response) {
+        console.log('AssistResponse is: ' + JSON.stringify(response));
+
+        // Check there is actually a value in result
+        if (response.dialog_state_out) {
+            console.log('Dialog state out received');
+
+            if (response.dialog_state_out.supplemental_display_text) {
+                audioState.googleResponseText += xmlescape(JSON.stringify(response.dialog_state_out.supplemental_display_text));
+                console.log('Supplemental text is: ' + audioState.googleResponseText);
             }
 
+            if (response.dialog_state_out.microphone_mode) {
+                if (response.dialog_state_out.microphone_mode === 'CLOSE_MICROPHONE') {
+                    audioState.microphoneOpen = false;
+                    scope$.attributes['microphone_open'] = false;
+                    console.log('closing microphone');
+                } else if (response.dialog_state_out.microphone_mode === 'DIALOG_FOLLOW_ON') {
+                    audioState.microphoneOpen = true;
+                    scope$.attributes['microphone_open'] = true;
+                    console.log('keeping microphone open');
+                }
+            }
 
+            if (response.dialog_state_out.conversation_state) {
+                if (response.dialog_state_out.conversation_state.length > 0) {
+                    console.log('Conversation state changed');
+                    conversationState = response.dialog_state_out.conversation_state;
+                    console.log('Conversation state var is: ' + conversationState);
+                    scope$.attributes['CONVERSATION_STATE'] = conversationState.toString();
+                }
+            }
+        }
 
+        // Deal with audio data from API
+        if (response.audio_out) {
+            //console.log('audio received')
+            const audio_chunk = response.audio_out.audio_data;
 
-     /// end of else /////       
-       
-          
+            if (audio_chunk instanceof Buffer) {
+                audioLength += audio_chunk.length;
+
+                if (!audioPresent) {
+                    audioPresent = true;
+                }
+
+                // Total length of MP3's in alexa skills must be less than 90 seconds.
+                if (audioLength <= (90 * 16 * 16000) / 8) {
+                    // Seconds x Bits per sample x samples per second / 8 to give bytes per second
+                    responseFile.write(audio_chunk);
+                } else {
+                    // we won't write any more timestamps
+                    console.log('Ignoring audio data as it is longer than 90 seconds');
+                }
+            }
+        }
+    });
+
+    conversation.write(assistRequest);
+    conversation.end();
+}
+
+// This function takes the response from the API and re-encodes using LAME
+// There is lots of reading and writing from temp files which isn't ideal
+// but I couldn't get piping to/from LAME work reliably in Lambda
+function executeEncode(audioState, scope$) {
+    console.log('Starting Transcode');
+
+    // Read the linear PCM response from file and create stream
+    const readpcm = fs.createReadStream('/tmp/response.pcm');
+
+    readpcm.on('end', function () {
+        console.log('pcm stream read complete');
+    });
+
+    // Create file to which MP3 will be written
+    const writemp3 = fs.createWriteStream('/tmp/response.mp3');
+
+    // Log when MP3 file is written
+    writemp3.on('finish', function () {
+        console.log('mp3 has been written');
+        // Create read stream from MP3 file
+        const readmp3 = fs.createReadStream('/tmp/response.mp3');
+        // Pipe to S3 upload function
+        readmp3.pipe(uploadFromStream(s3));
+    });
+
+    // Create LAME encoder instance
+    const encoder = new lame.Encoder({
+        // input
+        channels: 1, // 1 channels (MONO)
+        bitDepth: 16, // 16-bit samples
+        sampleRate: 16000, // 16,000 Hz sample rate
+        // output
+        bitRate: 48,
+        outSampleRate: 16000,
+        mode: lame.JOINTSTEREO, // STEREO (default), JOINTSTEREO, DUALCHANNEL or MONO
+    });
+
+    // The output from the google assistant is much lower than Alexa so we need to apply a gain
+    const vol = new Volume();
+
+    // Set volume gain on google output to be +75%
+    // Any more than this then we risk major clipping
+    vol.setVolume(1.75);
+
+    // Create function to upload MP3 file to S3
+    function uploadFromStream(s3) {
+        const pass = new Stream.PassThrough();
+        const filename = scope$.event.session.user.userId;
+        const params = { Bucket: S3_BUCKET, Key: filename, Body: pass };
+
+        s3.upload(params, function (err, data) {
+            if (err) {
+                console.log('S3 upload error: ' + err);
+                scope$.emit(':tell', 'There was an error uploading to S3. ');
+            } else {
+                // Upload has been successful - we can know issue an alexa response based upon microphone state
+                let signedURL;
+                // create a signed URL to the MP3 that expires after 5 seconds - this should be plenty of time to allow alexa to load and cache mp3
+                const signedParams = {
+                    Bucket: S3_BUCKET,
+                    Key: filename,
+                    Expires: 10,
+                    ResponseContentType: 'audio/mpeg',
+                };
+
+                s3.getSignedUrl('getObject', signedParams, function (err, url) {
+                    if (url) {
+                        // escape out any illegal XML characters;
+                        url = xmlescape(url);
+                        signedURL = url;
+
+                        // if response text is blank just add a speaker icon to response
+                        if (!audioState.googleResponseText) {
+                            audioState.googleResponseText = '"🔊"';
+                        }
+
+                        // remove any REPEAT AFTER ME form alexa utterance
+                        const cleanUtterance = audioState.alexaUtteranceText.replace('REPEAT AFTER ME ', '');
+                        let cardContent = 'Request:<br/><i>' + cleanUtterance + '</i><br/><br/>Supplemental Response:<br/>' + audioState.googleResponseText;
+
+                        // replace carriage returns with breaks
+                        cardContent = cardContent.replace(/\\n/g, '<br/>');
+
+                        // deal with any \&quot;
+                        cardContent = cardContent.replace(/\\&quot;/g, '&quot;');
+
+                        console.log(cardContent);
+
+                        const cardTitle = 'Google Assistant for Alexa';
+
+                        // Let remove any (playing sfx)
+                        cardContent = cardContent.replace(/(\(playing sfx\))/g, '🔊');
+
+                        const speechOutput = '<audio src="' + signedURL + '"/>';
+                        const template = {
+                            type: 'BodyTemplate1',
+                            token: 'bt1',
+                            backButton: 'HIDDEN',
+                            title: cardTitle,
+                            textContent: {
+                                primaryText: {
+                                    text: cardContent,
+                                    type: 'RichText',
+                                },
+                            },
+                        };
+
+                        scope$.response.speak(speechOutput);
+
+                        if (scope$.event.context.System.device.supportedInterfaces.Display) {
+                            scope$.response.renderTemplate(template);
+                        }
+
+                        // If API has requested Microphone to stay open then will create an Alexa 'Ask' response
+                        // We also keep the microphone on the launch intent 'Hello' request as for some reason the API closes the microphone
+                        if (audioState.microphoneOpen || audioState.alexaUtteranceText === 'Hello') {
+                            console.log('Microphone is open so keeping session open');
+                            scope$.response.listen(' ');
+                            scope$.emit(':responseReady');
+                        } else {
+                            // Otherwise we create an Alexa 'Tell' command which will close the session
+                            console.log('Microphone is closed so closing session');
+                            scope$.response.shouldEndSession(true);
+                            scope$.emit(':responseReady');
+                        }
+                    } else {
+                        scope$.emit(':tell', 'There was an error creating the signed URL.');
+                    }
+                });
+            }
+        });
+        return pass;
+    }
+
+    // When encoding of MP3 has finished we upload the result to S3
+    encoder.on(
+        'finish',
+        function () {
+            // Close the MP3 file
+            setTimeout(function () {
+                console.error('Encoding done!');
+                console.error('Streaming mp3 file to s3');
+                writemp3.end();
+            });
+        },
+        1000
+    );
+
+    // Pipe output of PCM file reader to the gain process
+    readpcm.pipe(vol);
+
+    // pipe the pcm output of the gain process to the LAME encoder
+    vol.pipe(encoder);
+
+    // Pipe output of LAME encoder into MP3 file writer
+    encoder.pipe(writemp3);
+}
+
+const handlers = {
+    LaunchRequest: async function () {
+        const scope$ = this;
+
+        if (!scope$.event.context.System.user.accessToken) {
+            scope$.emit(':tellWithLinkAccountCard', 'You must link your Google account to use this skill. Please use the link in the Alexa app to authorise your Google Account.');
+        } else {
+            try {
+                await getSecretParams();
+            } catch (err) {
+                console.error('Loading of SecretParams failed: ' + err);
+                scope$.emit(':tell', 'There was a problem loading the settings from the S3 Bucket.');
+                throw err;
+            }
+            if (!clientState.registered) {
+                try {
+                    await registerProject(scope$);
+                } catch (err) {
+                    console.error('Client setup failed: ' + err);
+                    scope$.emit(':tell', 'There was a problem setting up the project.');
+                    throw err;
+                }
+                console.log('Registration Function Complete');
+            }
+        }
+    },
+    SearchIntent: async function (overrideText) {
+        const scope$ = this;
+        const audioState = {
+            microphoneOpen: true,
+            alexaUtteranceText: '',
+            googleResponseText: '',
         };
-    
-    
+
+        // Have we received an direct utterance from another intent?
+        if (overrideText) {
+            audioState.alexaUtteranceText = overrideText;
+            console.log('Utterance received from another intent: ' + overrideText);
+        } else {
+            // use detected utterance
+            audioState.alexaUtteranceText = scope$.event.request.intent.slots.search.value;
+        }
+
+        console.log('Input text to be processed is "' + audioState.alexaUtteranceText + '"');
+        console.log('Starting Search Intent');
+
+        const accessToken = scope$.event.context.System.user.accessToken;
+
+        // Check whether we have a valid authentication token
+        if (!accessToken) {
+            // We haven't so create an account link card
+            scope$.emit(':tellWithLinkAccountCard', 'You must link your Google account to use this skill. Please use the link in the Alexa app to authorise your Google Account.');
+        } else {
+            try {
+                await getSecretParams();
+            } catch (err) {
+                console.error('Loading of SecretParams failed: ' + err);
+                scope$.emit(':tell', 'There was a problem loading the settings from the S3 Bucket.');
+                throw err;
+            }
+            if (!clientState.registered) {
+                try {
+                    await registerProject(scope$);
+                } catch (err) {
+                    console.error('Client setup failed: ' + err);
+                    scope$.emit(':tell', 'There was a problem setting up the project.');
+                    throw err;
+                }
+            }
+
+            console.log('token: ' + accessToken);
+            executeAssist(accessToken, audioState, this);
+        }
     },
-    
-    'Unhandled': function() {
+    Unhandled: function () {
         console.log('Unhandled event');
-        
-        var message = 'STOP';
-        this.emit('SearchIntent', message);
+        this.emit(':ask', "I'm not sure what you said. Can you repeat please");
     },
-    
-    'AMAZON.StopIntent' : function () {
-        console.log('Stop Intent')
-        var message = 'STOP';
-        this.emit('SearchIntent', message);
-        
-            
+    'AMAZON.StopIntent': function () {
+        console.log('Stop Intent');
+        if (this.attributes['microphone_open']) {
+            this.emit('SearchIntent', 'stop');
+        } else {
+            this.emit(':tell', 'Stopped');
+        }
     },
-    'AMAZON.CancelIntent' : function () {
-        console.log('Cancel Intent')
-        var message = 'CANCEL';
-        this.emit('SearchIntent', message);
+    'AMAZON.HelpIntent': function () {
+        console.log('Help Intent');
+        this.emit('SearchIntent', 'What can you do');
     },
-        
-    
-    'SessionEndedRequest': function () {
+    'AMAZON.CancelIntent': function () {
+        console.log('Cancel Intent');
+        if (this.attributes['microphone_open']) {
+            this.emit('SearchIntent', 'cancel');
+        } else {
+            this.emit(':tell', 'Cancelled');
+        }
+    },
+    'AMAZON.NoIntent': function () {
+        console.log('No Intent');
+        if (this.attributes['microphone_open']) {
+            this.emit('SearchIntent', 'no');
+        }
+    },
+    'AMAZON.YesIntent': function () {
+        console.log('Yes Intent');
+        if (this.attributes['microphone_open']) {
+            this.emit('SearchIntent', 'yes');
+        }
+    },
+    SessionEndedRequest: function () {
         console.log('Session ended request');
-        
-        console.log(`Session has ended with reason ${this.event.request.reason}`)
-        
+        console.log(`Session has ended with reason ${this.event.request.reason}`);
         // Google Assistant will keep the conversation thread open even if we don't give a response to an ask.
         // We need to close the conversation if an ask response is not given (which will end up here)
-        // The easiset way to do this is to just send a stop command and this will close the conversation for us
+        // The easiest way to do this is to just send a goodbye command and this will close the conversation for us
         // (this is against Amazons guides but we're not submitting this!)
-        var message = 'STOP';
-        this.emit('SearchIntent', message);
-        
-    }
+        if (this.attributes['microphone_open']) {
+            this.emit('SearchIntent', 'goodbye');
+        }
+    },
 };
 
-
-exports.handler = function(event, context, callback){
-    var alexa = Alexa.handler(event, context);
+exports.handler = function (event, context, callback) {
+    const alexa = Alexa.handler(event, context);
+    clientState.locale = event.request.locale;
     alexa.registerHandlers(handlers);
-    // Create DynamoDB Table
-    //alexa.dynamoDBTableName = 'AlexaAssistantSettings';
+    alexa.dynamoDBTableName = 'AlexaAssistantSkillSettings';
     alexa.execute();
 };
-
-
-
-
